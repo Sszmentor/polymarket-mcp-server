@@ -1,15 +1,111 @@
 """
-Tests for GitHub issue fixes (#2, #6, #10).
+Tests for GitHub issue fixes.
 
+- Issue #2: WebSocket background loop must start during server init
 - Issue #10: API credentials must not be logged at INFO level
 - Issue #6: fastapi dependency must be compatible with mcp's anyio requirement
-- Issue #2: Market discovery must filter out closed/expired markets
+- Regression: Market discovery must filter out closed/expired markets
 """
+import json
 import pytest
 import logging
 import importlib
 from unittest.mock import AsyncMock, patch, MagicMock
 from datetime import datetime, timedelta
+
+
+# ---------------------------------------------------------------------------
+# Issue #2 — WebSocket background loop startup
+# ---------------------------------------------------------------------------
+
+class TestWebSocketStartup:
+    """Verify that server init starts the WebSocket background stream."""
+
+    @pytest.mark.asyncio
+    async def test_initialize_server_starts_price_stream(self):
+        """initialize_server must start the long-lived WebSocket task."""
+        import polymarket_mcp.server as server_module
+        from polymarket_mcp.config import PolymarketConfig
+
+        await server_module.shutdown_server()
+
+        config = PolymarketConfig(DEMO_MODE=True)
+        mock_client = MagicMock()
+        mock_client.has_api_credentials.return_value = False
+        mock_client.create_api_credentials = AsyncMock(side_effect=RuntimeError("no creds"))
+
+        mock_ws_manager = MagicMock()
+        mock_ws_manager.start_price_stream = AsyncMock()
+        mock_ws_manager.stop_background_task = AsyncMock()
+
+        with patch.object(server_module, "load_config", return_value=config), \
+             patch.object(server_module, "create_polymarket_client", return_value=mock_client), \
+             patch.object(server_module, "create_safety_limits_from_config", return_value=MagicMock()), \
+             patch.object(server_module, "get_rate_limiter", return_value=MagicMock()), \
+             patch.object(server_module, "WebSocketManager", return_value=mock_ws_manager), \
+             patch.object(server_module.realtime, "set_websocket_manager") as mock_set_manager:
+            await server_module.initialize_server()
+
+        mock_ws_manager.start_price_stream.assert_awaited_once()
+        mock_set_manager.assert_called_once_with(mock_ws_manager)
+
+        await server_module.shutdown_server()
+
+    @pytest.mark.asyncio
+    async def test_reconnect_uses_exponential_backoff(self):
+        """Reconnect delay should grow exponentially from the current attempt count."""
+        from polymarket_mcp.config import PolymarketConfig
+        from polymarket_mcp.utils.websocket_manager import WebSocketManager
+
+        manager = WebSocketManager(PolymarketConfig(DEMO_MODE=True))
+        manager.reconnect_attempts = 2
+        manager.disconnect = AsyncMock()
+        manager.connect = AsyncMock()
+        manager._resubscribe_all = AsyncMock()
+
+        with patch("polymarket_mcp.utils.websocket_manager.asyncio.sleep", new=AsyncMock()) as mock_sleep:
+            await manager.reconnect()
+
+        mock_sleep.assert_awaited_once_with(4)
+        manager.disconnect.assert_awaited_once()
+        manager.connect.assert_awaited_once()
+        manager._resubscribe_all.assert_awaited_once()
+        assert manager.reconnect_attempts == 0
+        assert manager.reconnect_count == 1
+
+    @pytest.mark.asyncio
+    async def test_realtime_health_reports_cached_prices(self):
+        """Health output should reflect an active loop and populated price cache."""
+        from polymarket_mcp.config import PolymarketConfig
+        from polymarket_mcp.tools import realtime
+        from polymarket_mcp.utils.websocket_manager import WebSocketManager
+
+        manager = WebSocketManager(PolymarketConfig(DEMO_MODE=True))
+        manager.should_run = True
+        manager.background_task = MagicMock()
+        manager.background_task.done.return_value = False
+        manager.clob_connected = True
+        manager.realtime_connected = True
+
+        await manager.handle_message(
+            "clob",
+            {
+                "type": "price_change",
+                "asset_id": "asset-1",
+                "price": "0.61",
+                "timestamp": datetime.utcnow().isoformat(),
+                "market": "market-1",
+            },
+        )
+
+        realtime.set_websocket_manager(manager)
+        result = await realtime.handle_tool_call("get_realtime_health", {})
+        health = json.loads(result[0].text)
+
+        assert health["healthy"] is True
+        assert health["background_loop_running"] is True
+        assert health["price_cache_entries"] == 1
+        assert health["has_price_cache"] is True
 
 
 # ---------------------------------------------------------------------------

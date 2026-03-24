@@ -1,14 +1,17 @@
 """
 Real-time WebSocket tools for Polymarket MCP server.
 
-Provides 6 tools for real-time market data subscriptions:
+Provides 8 tools for real-time market data subscriptions:
 1. subscribe_market_prices - Monitor price changes
 2. subscribe_orderbook_updates - Real-time orderbook
 3. subscribe_user_orders - Monitor user's orders
 4. subscribe_user_trades - Monitor user's trades
 5. subscribe_market_resolution - Alert on market close
 6. get_realtime_status - Status of all subscriptions
+7. get_realtime_health - Background loop health check
+8. unsubscribe_realtime - Remove a realtime subscription
 """
+import json
 import logging
 from typing import Any, Dict, List, Optional
 
@@ -199,6 +202,19 @@ def get_tools() -> List[types.Tool]:
             }
         ),
         types.Tool(
+            name="get_realtime_health",
+            description=(
+                "Get a health snapshot for the WebSocket background loop. "
+                "Use this to verify that the background task is running, connections are live, "
+                "and price updates are being cached."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {},
+                "required": []
+            }
+        ),
+        types.Tool(
             name="unsubscribe_realtime",
             description=(
                 "Unsubscribe from a real-time data feed. "
@@ -249,6 +265,8 @@ async def handle_tool_call(name: str, arguments: Dict[str, Any]) -> List[types.T
             return await _subscribe_market_resolution(arguments)
         elif name == "get_realtime_status":
             return await _get_realtime_status(arguments)
+        elif name == "get_realtime_health":
+            return await _get_realtime_health(arguments)
         elif name == "unsubscribe_realtime":
             return await _unsubscribe_realtime(arguments)
         else:
@@ -579,6 +597,29 @@ async def _get_realtime_status(arguments: Dict[str, Any]) -> List[types.TextCont
         return [types.TextContent(
             type="text",
             text=f"Error getting status: {str(e)}"
+        )]
+
+
+async def _get_realtime_health(arguments: Dict[str, Any]) -> List[types.TextContent]:
+    """
+    Get background-loop health for the real-time WebSocket subsystem.
+
+    Args:
+        arguments: Tool arguments (unused)
+
+    Returns:
+        List of TextContent with JSON health details
+    """
+    try:
+        health = websocket_manager.get_health_status()
+        return [types.TextContent(
+            type="text",
+            text=json.dumps(health, indent=2)
+        )]
+    except Exception as e:
+        return [types.TextContent(
+            type="text",
+            text=f"Error getting realtime health: {str(e)}"
         )]
 
 
