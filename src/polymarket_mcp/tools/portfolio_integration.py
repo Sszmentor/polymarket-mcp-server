@@ -7,6 +7,16 @@ import mcp.types as types
 from .portfolio import PORTFOLIO_TOOLS
 
 
+def _validate_rate_limiter(rate_limiter) -> None:
+    """Ensure portfolio tools receive a RateLimiter-compatible dependency."""
+    acquire = getattr(rate_limiter, "acquire", None)
+    if not callable(acquire):
+        raise TypeError(
+            "Portfolio tools require a rate_limiter with an acquire() method. "
+            f"Got {type(rate_limiter).__name__}."
+        )
+
+
 def get_portfolio_tool_definitions() -> list[types.Tool]:
     """
     Get portfolio tool definitions for MCP server.
@@ -52,6 +62,8 @@ async def call_portfolio_tool(name: str, arguments: dict, polymarket_client, rat
 
     if not tool_handler:
         raise ValueError(f"Unknown portfolio tool: {name}")
+
+    _validate_rate_limiter(rate_limiter)
 
     # Call the handler with required dependencies
     result = await tool_handler(
