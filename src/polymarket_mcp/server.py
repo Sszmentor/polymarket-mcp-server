@@ -133,6 +133,10 @@ async def read_resource(uri: str) -> str:
                 polymarket_client.has_api_credentials()
                 if polymarket_client else False
             ),
+            "websocket": (
+                websocket_manager.get_health_status()
+                if websocket_manager else None
+            ),
             "server_version": "0.1.0",
         }
         return json.dumps(status_data, indent=2)
@@ -214,11 +218,11 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> list[types.TextCont
         # Route to real-time websocket tools
         elif name in ["subscribe_market_prices", "subscribe_orderbook_updates", "subscribe_user_orders",
                       "subscribe_user_trades", "subscribe_market_resolution", "get_realtime_status",
-                      "unsubscribe_realtime"]:
+                      "get_realtime_health", "unsubscribe_realtime"]:
             if not websocket_manager:
                 raise ValueError("WebSocket manager not initialized")
-            result = await realtime.handle_tool(name, arguments, websocket_manager, server)
-            return [types.TextContent(type="text", text=json.dumps(result, indent=2))]
+            realtime.set_websocket_manager(websocket_manager)
+            return await realtime.handle_tool_call(name, arguments)
 
         # Route to trading tools
         elif trading_tools:
@@ -289,6 +293,9 @@ async def initialize_server() -> None:
     global config, polymarket_client, safety_limits, trading_tools, websocket_manager
 
     try:
+        if websocket_manager:
+            await websocket_manager.stop_background_task()
+
         # Load configuration
         logger.info("Loading configuration...")
         config = load_config()
@@ -352,8 +359,8 @@ async def initialize_server() -> None:
         # Initialize WebSocket manager
         logger.info("Initializing WebSocket manager...")
         websocket_manager = WebSocketManager(config)
-        # Connect WebSocket (non-blocking)
-        asyncio.create_task(websocket_manager.connect())
+        realtime.set_websocket_manager(websocket_manager)
+        await websocket_manager.start_price_stream()
         logger.info("WebSocket manager initialized with 7 real-time tools")
 
         logger.info("Server initialization complete!")
@@ -371,6 +378,20 @@ async def initialize_server() -> None:
     except Exception as e:
         logger.error(f"Failed to initialize server: {e}")
         raise
+
+
+async def shutdown_server() -> None:
+    """Stop background tasks and clear server globals."""
+    global config, polymarket_client, safety_limits, trading_tools, websocket_manager
+
+    if websocket_manager:
+        await websocket_manager.stop_background_task()
+
+    config = None
+    polymarket_client = None
+    safety_limits = None
+    trading_tools = None
+    websocket_manager = None
 
 
 async def main() -> None:
@@ -397,6 +418,8 @@ async def main() -> None:
     except Exception as e:
         logger.error(f"Server error: {e}")
         raise
+    finally:
+        await shutdown_server()
 
 
 def run():

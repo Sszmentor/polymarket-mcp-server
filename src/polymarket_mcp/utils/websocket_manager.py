@@ -185,6 +185,14 @@ class WebSocketManager:
         self.message_buffer: List[Dict[str, Any]] = []
         self.max_buffer_size = 1000
 
+        # Health and cache state
+        self.price_cache: Dict[str, Dict[str, Any]] = {}
+        self.last_message_at: Dict[str, Optional[datetime]] = {
+            "clob": None,
+            "realtime": None,
+        }
+        self.last_price_update_at: Optional[datetime] = None
+
         logger.info("WebSocketManager initialized")
 
     async def connect(self) -> None:
@@ -293,16 +301,18 @@ class WebSocketManager:
         logger.info("Disconnecting WebSocket connections...")
 
         # Close CLOB connection
-        if self.clob_ws and not self.clob_ws.closed:
+        if self._ws_is_open(self.clob_ws):
             await self.clob_ws.close()
             logger.info("CLOB WebSocket disconnected")
+        self.clob_ws = None
         self.clob_connected = False
         self.authenticated = False
 
         # Close real-time connection
-        if self.realtime_ws and not self.realtime_ws.closed:
+        if self._ws_is_open(self.realtime_ws):
             await self.realtime_ws.close()
             logger.info("Real-time WebSocket disconnected")
+        self.realtime_ws = None
         self.realtime_connected = False
 
         logger.info("All WebSocket connections closed")
@@ -314,14 +324,13 @@ class WebSocketManager:
         Implements exponential backoff strategy to avoid overwhelming the server.
         """
         self.reconnect_count += 1
-
-        # Calculate backoff delay
+        attempt = self.reconnect_attempts + 1
         delay = min(
             self.INITIAL_RECONNECT_DELAY * (self.RECONNECT_MULTIPLIER ** self.reconnect_attempts),
-            self.MAX_RECONNECT_DELAY
+            self.MAX_RECONNECT_DELAY,
         )
 
-        logger.info(f"Reconnecting in {delay}s (attempt {self.reconnect_attempts + 1})...")
+        logger.info(f"Reconnecting in {delay}s (attempt {attempt})...")
         await asyncio.sleep(delay)
 
         try:
@@ -342,7 +351,7 @@ class WebSocketManager:
         except Exception as e:
             logger.error(f"Reconnection failed: {e}")
             self.reconnect_attempts += 1
-            # Will retry in next iteration
+            raise
 
     async def _resubscribe_all(self) -> None:
         """Resubscribe to all active subscriptions after reconnect"""
@@ -543,6 +552,14 @@ class WebSocketManager:
                 timestamp=datetime.fromisoformat(data.get("timestamp", datetime.now().isoformat())),
                 market=data.get("market")
             )
+
+            self.price_cache[event.asset_id] = {
+                "asset_id": event.asset_id,
+                "market": event.market,
+                "price": float(event.price),
+                "timestamp": event.timestamp.isoformat(),
+            }
+            self.last_price_update_at = event.timestamp
 
             # Find matching subscriptions
             matching_subs = self._find_matching_subscriptions(
@@ -758,6 +775,15 @@ class WebSocketManager:
 
         Runs continuously until stopped, processing messages from both WebSockets.
         """
+        await self.start_price_stream()
+
+    async def start_price_stream(self) -> None:
+        """
+        Start the long-lived WebSocket price stream loop.
+
+        This creates the background task that owns connection setup, retries,
+        and message processing for both WebSocket feeds.
+        """
         if self.background_task and not self.background_task.done():
             logger.warning("Background task already running")
             return
@@ -776,9 +802,14 @@ class WebSocketManager:
         if self.background_task:
             try:
                 await asyncio.wait_for(self.background_task, timeout=5.0)
+            except asyncio.CancelledError:
+                pass
             except asyncio.TimeoutError:
                 logger.warning("Background task did not stop gracefully, cancelling...")
                 self.background_task.cancel()
+                await asyncio.gather(self.background_task, return_exceptions=True)
+
+        self.background_task = None
 
         await self.disconnect()
         logger.info("Background task stopped")
@@ -796,17 +827,20 @@ class WebSocketManager:
             try:
                 # Ensure connections are active
                 if not self.clob_connected or not self.realtime_connected:
-                    await self.reconnect()
+                    try:
+                        await self.reconnect()
+                    except Exception:
+                        continue
                     continue
 
                 # Process messages from both WebSockets
                 tasks = []
 
-                if self.clob_ws and not self.clob_ws.closed:
-                    tasks.append(self._receive_clob_messages())
+                if self._ws_is_open(self.clob_ws):
+                    tasks.append(asyncio.create_task(self._receive_clob_messages()))
 
-                if self.realtime_ws and not self.realtime_ws.closed:
-                    tasks.append(self._receive_realtime_messages())
+                if self._ws_is_open(self.realtime_ws):
+                    tasks.append(asyncio.create_task(self._receive_realtime_messages()))
 
                 if tasks:
                     # Wait for any message or timeout
@@ -819,47 +853,104 @@ class WebSocketManager:
                     # Cancel pending tasks
                     for task in pending:
                         task.cancel()
+                    if pending:
+                        await asyncio.gather(*pending, return_exceptions=True)
+
+                    for task in done:
+                        exc = task.exception()
+                        if exc:
+                            raise exc
                 else:
                     await asyncio.sleep(1.0)
 
+            except asyncio.CancelledError:
+                raise
             except websockets.exceptions.ConnectionClosed:
                 logger.warning("WebSocket connection closed, reconnecting...")
-                await self.reconnect()
+                self._sync_connection_flags()
             except Exception as e:
                 logger.error(f"Error in background loop: {e}", exc_info=True)
+                self._sync_connection_flags()
                 await asyncio.sleep(1.0)
 
         logger.info("Background WebSocket loop stopped")
 
     async def _receive_clob_messages(self) -> None:
         """Receive messages from CLOB WebSocket"""
-        if not self.clob_ws or self.clob_ws.closed:
+        if not self._ws_is_open(self.clob_ws):
             return
 
         try:
             message = await self.clob_ws.recv()
             data = json.loads(message)
+            self.last_message_at["clob"] = datetime.now()
             await self.handle_message("clob", data)
         except json.JSONDecodeError as e:
             logger.error(f"Failed to parse CLOB message: {e}")
+        except websockets.exceptions.ConnectionClosed:
+            self.clob_connected = False
+            self.authenticated = False
+            raise
         except Exception as e:
             logger.error(f"Error receiving CLOB message: {e}")
             raise
 
     async def _receive_realtime_messages(self) -> None:
         """Receive messages from real-time WebSocket"""
-        if not self.realtime_ws or self.realtime_ws.closed:
+        if not self._ws_is_open(self.realtime_ws):
             return
 
         try:
             message = await self.realtime_ws.recv()
             data = json.loads(message)
+            self.last_message_at["realtime"] = datetime.now()
             await self.handle_message("realtime", data)
         except json.JSONDecodeError as e:
             logger.error(f"Failed to parse real-time message: {e}")
+        except websockets.exceptions.ConnectionClosed:
+            self.realtime_connected = False
+            raise
         except Exception as e:
             logger.error(f"Error receiving real-time message: {e}")
             raise
+
+    def _ws_is_open(self, ws: Optional[websockets.WebSocketClientProtocol]) -> bool:
+        """Return True when a WebSocket object exists and is still open."""
+        return bool(ws) and not getattr(ws, "closed", False)
+
+    def _sync_connection_flags(self) -> None:
+        """Update connection booleans from the current WebSocket objects."""
+        self.clob_connected = self._ws_is_open(self.clob_ws)
+        self.realtime_connected = self._ws_is_open(self.realtime_ws)
+        if not self.clob_connected:
+            self.authenticated = False
+
+    def get_health_status(self) -> Dict[str, Any]:
+        """Return a compact health snapshot for the background stream."""
+        background_running = bool(
+            self.background_task and not self.background_task.done() and self.should_run
+        )
+        connections_ready = self.clob_connected and self.realtime_connected
+
+        return {
+            "healthy": background_running and connections_ready,
+            "background_loop_running": background_running,
+            "connections_ready": connections_ready,
+            "price_cache_entries": len(self.price_cache),
+            "has_price_cache": bool(self.price_cache),
+            "last_price_update": (
+                self.last_price_update_at.isoformat() if self.last_price_update_at else None
+            ),
+            "last_messages": {
+                name: value.isoformat() if value else None
+                for name, value in self.last_message_at.items()
+            },
+            "reconnect": {
+                "attempts": self.reconnect_attempts,
+                "count": self.reconnect_count,
+                "last_reconnect": self.last_reconnect_time or None,
+            },
+        }
 
     def get_status(self) -> Dict[str, Any]:
         """
@@ -869,6 +960,7 @@ class WebSocketManager:
             Dictionary with connection status, subscriptions, and statistics
         """
         return {
+            "health": self.get_health_status(),
             "connections": {
                 "clob": {
                     "connected": self.clob_connected,
